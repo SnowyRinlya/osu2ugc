@@ -1,0 +1,11 @@
+[package]
+name = "osu2ugc"
+version = "0.1.0"
+edition = "2021"
+description = "Convert osu!mania 4K .osu beatmaps to UMIGURI .ugc charts"
+license = "MIT"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
