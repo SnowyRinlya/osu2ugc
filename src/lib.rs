@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::fmt::Write as _;
 use std::fs;
@@ -8,10 +9,21 @@ const TICKS_PER_BEAT: f64 = 480.0;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Warning(pub String);
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SixKeyLayout {
+    /// Widths 3, 2, 3, 3, 2, 3 across all 16 units.
+    #[default]
+    Full,
+    /// Six width-2 lanes at units 2..14, leaving two units on each side.
+    Centered,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ConvertOptions {
     /// Adds a DAMAGE note at the end position of every converted long note.
     pub damage_ln_end: bool,
+    /// Applies only to 6K maps. Other key counts retain their existing layouts.
+    pub six_key_layout: SixKeyLayout,
 }
 
 #[derive(Debug)]
@@ -122,6 +134,7 @@ fn render_ugc(
     source: &str,
     options: ConvertOptions,
 ) -> Result<(String, Vec<Warning>), ConvertError> {
+    let layout = LaneLayout::from_key_count(map.key_count, options.six_key_layout)?;
     let mut timing = map.timing.clone();
     timing.sort_by(|a, b| {
         a.time
@@ -129,6 +142,7 @@ fn render_ugc(
             .unwrap_or(Ordering::Equal)
             .then(a.order.cmp(&b.order))
     });
+    extend_timing_for_early_notes(&mut timing, &map.objects);
     let red: Vec<_> = timing.iter().filter(|point| point.uninherited).collect();
     let origin = red[0];
     let mut warnings = Vec::new();
@@ -137,11 +151,7 @@ fn render_ugc(
     let artist = preferred(&map.artist_unicode, &map.artist);
     let level = chart_level(&map.version);
     let chart_const = level.trim_end_matches('+').parse::<f64>().unwrap_or(0.0);
-    let id_seed = format!("{}\0{}\0{}", title, artist, map.audio);
-    let song_id = format!(
-        "MGC{}",
-        stable_uuid(&id_seed).replace('-', "").to_uppercase()
-    );
+    let song_id = stable_song_id(map, source, options);
     let mut output = String::new();
 
     writeln!(output, "' Converted from osu!mania by osu2ugc").unwrap();
@@ -240,9 +250,10 @@ fn render_ugc(
                 let tick = nonnegative_tick(time_to_tick(time, &red), &mut warnings, "音符");
                 writeln!(
                     output,
-                    "#{}:t{}4",
+                    "#{}:t{}{}",
                     format_bar_tick(tick, &meters),
-                    base36(lane_start(x) as u32)
+                    base36(layout.lane_start(x) as u32),
+                    layout.lane_width(x)
                 )
                 .unwrap();
             }
@@ -252,18 +263,20 @@ fn render_ugc(
                 let end_tick = nonnegative_tick(time_to_tick(end, &red), &mut warnings, "长按终点");
                 writeln!(
                     output,
-                    "#{}:h{}4",
+                    "#{}:h{}{}",
                     format_bar_tick(start_tick, &meters),
-                    base36(lane_start(x) as u32)
+                    base36(layout.lane_start(x) as u32),
+                    layout.lane_width(x)
                 )
                 .unwrap();
                 writeln!(output, "#{}>s", end_tick.saturating_sub(start_tick)).unwrap();
                 if options.damage_ln_end {
                     writeln!(
                         output,
-                        "#{}:d{}4",
+                        "#{}:d{}{}",
                         format_bar_tick(end_tick, &meters),
-                        base36(lane_start(x) as u32)
+                        base36(layout.lane_start(x) as u32),
+                        layout.lane_width(x)
                     )
                     .unwrap();
                 }
@@ -272,6 +285,37 @@ fn render_ugc(
     }
     let _ = source;
     Ok((output, warnings))
+}
+
+fn extend_timing_for_early_notes(timing: &mut Vec<TimingPoint>, objects: &[HitObject]) {
+    let first_red = timing
+        .iter()
+        .find(|point| point.uninherited)
+        .unwrap()
+        .clone();
+    let earliest = objects
+        .iter()
+        .map(object_time)
+        .chain(timing.iter().map(|point| point.time))
+        .fold(first_red.time, f64::min);
+    if earliest >= first_red.time {
+        return;
+    }
+    // Extend the initial tempo backwards by whole bars. This preserves the
+    // existing bar grid and moves the audio offset along with the chart origin,
+    // so early notes and hold starts are not clamped to the first red line.
+    let bar_ms = first_red.beat_length * f64::from(first_red.meter.max(1));
+    if !bar_ms.is_finite() || bar_ms <= 0.0 {
+        return;
+    }
+    let bars = ((first_red.time - earliest) / bar_ms).ceil();
+    timing.insert(
+        0,
+        TimingPoint {
+            time: first_red.time - bars * bar_ms,
+            ..first_red
+        },
+    );
 }
 
 fn build_meter_segments(red: &[&TimingPoint], warnings: &mut Vec<Warning>) -> Vec<MeterSegment> {
@@ -460,14 +504,7 @@ fn validate(map: &Beatmap) -> Result<(), ConvertError> {
             "只支持 osu!mania（Mode: 3）谱面".to_owned(),
         ));
     }
-    let keys = map
-        .key_count
-        .ok_or_else(|| ConvertError::Invalid("缺少 CircleSize".to_owned()))?;
-    if (keys - 4.0).abs() > 0.001 {
-        return Err(ConvertError::Invalid(format!(
-            "只支持 4K 谱面，当前 CircleSize 为 {keys}"
-        )));
-    }
+    LaneLayout::from_key_count(map.key_count, SixKeyLayout::default())?;
     if map.audio.is_empty() {
         return Err(ConvertError::Invalid("缺少 AudioFilename".to_owned()));
     }
@@ -481,6 +518,7 @@ fn validate(map: &Beatmap) -> Result<(), ConvertError> {
 
 #[allow(dead_code)]
 fn render_mgcf(map: &Beatmap, source: &str) -> Result<(String, Vec<Warning>), ConvertError> {
+    let layout = LaneLayout::from_key_count(map.key_count, SixKeyLayout::default())?;
     let mut timing = map.timing.clone();
     timing.sort_by(|a, b| {
         a.time
@@ -585,14 +623,35 @@ fn render_mgcf(map: &Beatmap, source: &str) -> Result<(String, Vec<Warning>), Co
         match *object {
             HitObject::Tap { x, time } => {
                 let tick = nonnegative_tick(time_to_tick(time, &red), &mut warnings, "音符");
-                write_note(&mut output, "t", "N", tick, lane_start(x));
+                write_note(
+                    &mut output,
+                    "t",
+                    "N",
+                    tick,
+                    layout.lane_start(x),
+                    layout.lane_width(x),
+                );
             }
             HitObject::Hold { x, start, end } => {
                 let start_tick =
                     nonnegative_tick(time_to_tick(start, &red), &mut warnings, "长按起点");
                 let end_tick = nonnegative_tick(time_to_tick(end, &red), &mut warnings, "长按终点");
-                write_note(&mut output, "h", "BG", start_tick, lane_start(x));
-                write_note(&mut output, ".h", "EN", end_tick, lane_start(x));
+                write_note(
+                    &mut output,
+                    "h",
+                    "BG",
+                    start_tick,
+                    layout.lane_start(x),
+                    layout.lane_width(x),
+                );
+                write_note(
+                    &mut output,
+                    ".h",
+                    "EN",
+                    end_tick,
+                    layout.lane_start(x),
+                    layout.lane_width(x),
+                );
             }
         }
     }
@@ -631,12 +690,55 @@ fn measure_at_tick(tick: i64, meter: u32) -> i64 {
     tick.div_euclid(ticks_per_measure)
 }
 
-fn lane_start(x: i32) -> i32 {
-    let lane = ((i64::from(x).clamp(0, 511) * 4) / 512) as i32;
-    lane * 4
+struct LaneLayout {
+    lanes: &'static [(i32, i32)],
 }
 
-fn write_note(output: &mut String, kind: &str, subtype: &str, tick: i64, lane: i32) {
+impl LaneLayout {
+    fn from_key_count(
+        keys: Option<f64>,
+        six_key_layout: SixKeyLayout,
+    ) -> Result<Self, ConvertError> {
+        match keys {
+            Some(4.0) => Ok(Self {
+                lanes: &[(0, 4), (4, 4), (8, 4), (12, 4)],
+            }),
+            Some(5.0) => Ok(Self {
+                lanes: &[(0, 3), (3, 3), (6, 3), (9, 3), (12, 3)],
+            }),
+            Some(6.0) => Ok(Self {
+                lanes: match six_key_layout {
+                    SixKeyLayout::Full => &[(0, 3), (3, 2), (5, 3), (8, 3), (11, 2), (13, 3)],
+                    SixKeyLayout::Centered => &[(2, 2), (4, 2), (6, 2), (8, 2), (10, 2), (12, 2)],
+                },
+            }),
+            Some(7.0) => Ok(Self {
+                lanes: &[(0, 2), (2, 2), (4, 2), (6, 2), (8, 2), (10, 2), (12, 2)],
+            }),
+            Some(keys) => Err(ConvertError::Invalid(format!(
+                "只支持 4K、5K、6K 或 7K 谱面，当前 CircleSize 为 {keys}"
+            ))),
+            None => Err(ConvertError::Invalid("缺少 CircleSize".to_owned())),
+        }
+    }
+
+    fn lane(&self, x: i32) -> (i32, i32) {
+        // Decode the source column using its actual key count, then place it
+        // using explicit destination positions and widths.
+        let index = (i64::from(x).clamp(0, 511) * self.lanes.len() as i64 / 512) as usize;
+        self.lanes[index]
+    }
+
+    fn lane_start(&self, x: i32) -> i32 {
+        self.lane(x).0
+    }
+
+    fn lane_width(&self, x: i32) -> i32 {
+        self.lane(x).1
+    }
+}
+
+fn write_note(output: &mut String, kind: &str, subtype: &str, tick: i64, lane: i32, width: i32) {
     line(
         output,
         &[
@@ -646,7 +748,7 @@ fn write_note(output: &mut String, kind: &str, subtype: &str, tick: i64, lane: i
             "N",
             &tick.to_string(),
             &lane.to_string(),
-            "4",
+            &width.to_string(),
             "8",
             "0",
             "0",
@@ -686,6 +788,41 @@ fn chart_level(version: &str) -> String {
     } else {
         "1".to_owned()
     }
+}
+
+// All converted charts use DIFF=3, so separate source difficulties must also
+// have separate song IDs. Version this domain only if the identity rules change.
+fn stable_song_id(map: &Beatmap, source: &str, options: ConvertOptions) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"SnowyRinlya/osu2ugc/song-id/v2\0");
+    let layout = match map.key_count {
+        Some(4.0) => "4k-full-4",
+        Some(5.0) => "5k-left-3",
+        Some(6.0) => match options.six_key_layout {
+            SixKeyLayout::Full => "6k-full-323323",
+            SixKeyLayout::Centered => "6k-centered-2",
+        },
+        Some(7.0) => "7k-left-2",
+        _ => unreachable!("key count validated before rendering"),
+    };
+    hash.update(layout.as_bytes());
+    hash.update([0, u8::from(options.damage_ln_end), 0]);
+    // Include source content, not just its title or possibly reused BeatmapID.
+    // Ignore transport/editor-only BOM, CRLF, blank lines and full-line comments.
+    for line in source.trim_start_matches('\u{feff}').lines().map(str::trim) {
+        if !line.is_empty() && !line.starts_with("//") {
+            hash.update(line.as_bytes());
+            hash.update(b"\n");
+        }
+    }
+    let digest = hash.finalize();
+    let mut id = String::from("O2U");
+    // Keep the existing 35-character ASCII shape, with a dedicated prefix and
+    // 128 bits from SHA-256. No finite ID scheme guarantees global uniqueness.
+    for byte in &digest[..16] {
+        write!(id, "{byte:02X}").unwrap();
+    }
+    id
 }
 
 fn stable_uuid(source: &str) -> String {
@@ -803,9 +940,173 @@ CircleSize:4
     }
 
     #[test]
-    fn rejects_non_four_key_map() {
-        let error = convert_str(&MAP.replace("CircleSize:4", "CircleSize:7")).unwrap_err();
-        assert!(error.to_string().contains("只支持 4K"));
+    fn rejects_unsupported_key_counts() {
+        for keys in ["3", "8", "4.5", "NaN", "inf"] {
+            let error = convert_str(&MAP.replace("CircleSize:4", &format!("CircleSize:{keys}")))
+                .unwrap_err();
+            assert!(error.to_string().contains("只支持 4K、5K、6K 或 7K"));
+        }
+    }
+
+    #[test]
+    fn converts_five_key_taps_holds_and_damage_left_aligned() {
+        let mut source = MAP
+            .split("[HitObjects]")
+            .next()
+            .unwrap()
+            .replace("CircleSize:4", "CircleSize:5");
+        source.push_str("[HitObjects]\n");
+        for x in [51, 153, 256, 358, 460] {
+            writeln!(source, "{x},192,1000,1,0,0:0:0:0:").unwrap();
+            writeln!(source, "{x},192,1500,128,0,2500:0:0:0:0:").unwrap();
+        }
+        let (output, warnings) = convert_str_with_options(
+            &source,
+            ConvertOptions {
+                damage_ln_end: true,
+                ..ConvertOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(warnings.is_empty());
+        for lane in ['0', '3', '6', '9', 'C'] {
+            assert!(output.contains(&format!("#0'0:t{lane}3\n")));
+            assert!(output.contains(&format!("#0'480:h{lane}3\n#960>s\n#0'1440:d{lane}3\n")));
+        }
+        assert_eq!(output.lines().filter(|line| line.contains(':')).count(), 15);
+        assert!(!convert_str(&source).unwrap().0.contains(":d"));
+    }
+
+    #[test]
+    fn five_key_column_boundaries_and_clamping() {
+        let layout = LaneLayout::from_key_count(Some(5.0), SixKeyLayout::default()).unwrap();
+        for (start, end, expected) in [
+            (0, 102, 0),
+            (103, 204, 3),
+            (205, 307, 6),
+            (308, 409, 9),
+            (410, 511, 12),
+        ] {
+            for x in start..=end {
+                assert_eq!(layout.lane(x), (expected, 3));
+            }
+        }
+        assert_eq!(layout.lane(i32::MIN), (0, 3));
+        assert_eq!(layout.lane(i32::MAX), (12, 3));
+    }
+
+    #[test]
+    fn converts_seven_lanes_taps_holds_and_damage() {
+        let mut source = MAP
+            .split("[HitObjects]")
+            .next()
+            .unwrap()
+            .replace("CircleSize:4", "CircleSize:7");
+        source.push_str("[HitObjects]\n");
+        for x in [36, 109, 182, 256, 329, 402, 475] {
+            writeln!(source, "{x},192,1000,1,0,0:0:0:0:").unwrap();
+            writeln!(source, "{x},192,1500,128,0,2500:0:0:0:0:").unwrap();
+        }
+        let (output, warnings) = convert_str_with_options(
+            &source,
+            ConvertOptions {
+                damage_ln_end: true,
+                ..ConvertOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(warnings.is_empty());
+        for lane in ['0', '2', '4', '6', '8', 'A', 'C'] {
+            assert!(output.contains(&format!("#0'0:t{lane}2\n")));
+            assert!(output.contains(&format!("#0'480:h{lane}2\n#960>s\n#0'1440:d{lane}2\n")));
+        }
+        assert_eq!(output.lines().filter(|line| line.contains(':')).count(), 21);
+        let (default_output, _) = convert_str(&source).unwrap();
+        assert!(!default_output.contains(":d"));
+    }
+
+    #[test]
+    fn seven_key_column_boundaries_and_clamping() {
+        let layout = LaneLayout::from_key_count(Some(7.0), SixKeyLayout::default()).unwrap();
+        for (start, end, expected) in [
+            (0, 73, 0),
+            (74, 146, 2),
+            (147, 219, 4),
+            (220, 292, 6),
+            (293, 365, 8),
+            (366, 438, 10),
+            (439, 511, 12),
+        ] {
+            for x in start..=end {
+                assert_eq!(layout.lane_start(x), expected);
+            }
+        }
+        assert_eq!(layout.lane_start(i32::MIN), 0);
+        assert_eq!(layout.lane_start(i32::MAX), 12);
+    }
+
+    #[test]
+    fn song_ids_separate_difficulties_edits_layouts_and_ln_options() {
+        fn id(source: &str, options: ConvertOptions) -> String {
+            convert_str_with_options(source, options)
+                .unwrap()
+                .0
+                .lines()
+                .find_map(|line| line.strip_prefix("@SONGID\t"))
+                .unwrap()
+                .to_owned()
+        }
+        let defaults = ConvertOptions::default();
+        let original = id(MAP, defaults);
+        assert!(original.starts_with("O2U"));
+        assert_eq!(original.len(), 35);
+        assert!(original[3..].bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(original, id(MAP, defaults));
+        assert_eq!(
+            original,
+            id(
+                &format!("\u{feff}// comment\r\n{}", MAP.replace('\n', "\r\n")),
+                defaults
+            )
+        );
+        assert_ne!(
+            original,
+            id(&MAP.replace("Hard [12]", "Another [12]"), defaults)
+        );
+        assert_ne!(
+            original,
+            id(&MAP.replace("64,192,1000", "128,192,1000"), defaults)
+        );
+        assert_ne!(
+            original,
+            id(
+                MAP,
+                ConvertOptions {
+                    damage_ln_end: true,
+                    ..defaults
+                }
+            )
+        );
+        assert_ne!(
+            original,
+            id(&MAP.replace("CircleSize:4", "CircleSize:7"), defaults)
+        );
+        // A 6K-only option must not change identities for other key counts.
+        assert_eq!(
+            original,
+            id(
+                MAP,
+                ConvertOptions {
+                    six_key_layout: SixKeyLayout::Centered,
+                    ..defaults
+                }
+            )
+        );
+        let registered = MAP.replace("[Metadata]", "[Metadata]\nBeatmapID:12345");
+        assert_ne!(
+            id(&registered, defaults),
+            id(&registered.replace("64,192,1000", "128,192,1000"), defaults)
+        );
     }
 
     #[test]
@@ -814,11 +1115,125 @@ CircleSize:4
     }
 
     #[test]
+    fn converts_both_six_key_layouts_with_holds_and_damage() {
+        let mut source = MAP
+            .split("[HitObjects]")
+            .next()
+            .unwrap()
+            .replace("CircleSize:4", "CircleSize:6");
+        source.push_str("[HitObjects]\n");
+        for x in [42, 128, 213, 298, 384, 469] {
+            writeln!(source, "{x},192,1000,1,0,0:0:0:0:").unwrap();
+            writeln!(source, "{x},192,1500,128,0,2500:0:0:0:0:").unwrap();
+        }
+        let mut ids = Vec::new();
+        for (six_key_layout, lanes) in [
+            (SixKeyLayout::Full, ["03", "32", "53", "83", "B2", "D3"]),
+            (SixKeyLayout::Centered, ["22", "42", "62", "82", "A2", "C2"]),
+        ] {
+            let (output, warnings) = convert_str_with_options(
+                &source,
+                ConvertOptions {
+                    damage_ln_end: true,
+                    six_key_layout,
+                },
+            )
+            .unwrap();
+            assert!(warnings.is_empty());
+            for lane in lanes {
+                assert!(output.contains(&format!("#0'0:t{lane}\n")));
+                assert!(output.contains(&format!("#0'480:h{lane}\n#960>s\n#0'1440:d{lane}\n")));
+            }
+            assert_eq!(output.lines().filter(|line| line.contains(':')).count(), 18);
+            ids.push(
+                output
+                    .lines()
+                    .find(|line| line.starts_with("@SONGID\t"))
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        assert_ne!(ids[0], ids[1]);
+        let (default_output, _) = convert_str(&source).unwrap();
+        let (full_output, _) = convert_str_with_options(
+            &source,
+            ConvertOptions {
+                six_key_layout: SixKeyLayout::Full,
+                ..ConvertOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(default_output, full_output);
+        assert!(!default_output.contains(":d"));
+    }
+
+    #[test]
+    fn six_key_column_boundaries_and_clamping() {
+        let full = LaneLayout::from_key_count(Some(6.0), SixKeyLayout::Full).unwrap();
+        let centered = LaneLayout::from_key_count(Some(6.0), SixKeyLayout::Centered).unwrap();
+        for (start, end, full_lane, centered_lane) in [
+            (0, 85, (0, 3), (2, 2)),
+            (86, 170, (3, 2), (4, 2)),
+            (171, 255, (5, 3), (6, 2)),
+            (256, 341, (8, 3), (8, 2)),
+            (342, 426, (11, 2), (10, 2)),
+            (427, 511, (13, 3), (12, 2)),
+        ] {
+            for x in start..=end {
+                assert_eq!(full.lane(x), full_lane);
+                assert_eq!(centered.lane(x), centered_lane);
+            }
+        }
+        assert_eq!(full.lane(i32::MIN), (0, 3));
+        assert_eq!(full.lane(i32::MAX), (13, 3));
+        assert_eq!(centered.lane(i32::MIN), (2, 2));
+        assert_eq!(centered.lane(i32::MAX), (12, 2));
+    }
+
+    #[test]
+    fn six_key_option_does_not_change_other_key_counts() {
+        for source in [
+            MAP.to_owned(),
+            MAP.replace("CircleSize:4", "CircleSize:5"),
+            MAP.replace("CircleSize:4", "CircleSize:7"),
+        ] {
+            let default = convert_str(&source).unwrap();
+            let centered = convert_str_with_options(
+                &source,
+                ConvertOptions {
+                    six_key_layout: SixKeyLayout::Centered,
+                    ..ConvertOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(default, centered);
+        }
+    }
+
+    #[test]
+    fn preserves_notes_and_holds_before_the_first_red_line() {
+        let source = MAP.replace(
+            "[HitObjects]\n",
+            "[HitObjects]\n64,192,500,1,0,0:0:0:0:\n192,192,750,128,0,1500:0:0:0:0:\n",
+        );
+        let (output, warnings) = convert_str(&source).unwrap();
+        assert!(warnings.is_empty());
+        assert!(output.contains("@BGMOFS\t1.00000\n"));
+        assert!(output.contains("@BPM\t0'0\t120.00000\n"));
+        assert!(output.contains("@BPM\t1'0\t120.00000\n"));
+        assert!(output.contains("#0'1440:t04\n"));
+        assert!(output.contains("#0'1680:h44\n#720>s\n"));
+        assert!(output.contains("#1'0:t04\n"));
+        // Chart time 1.5 s minus BGM delay 1 s = original note time 500 ms.
+    }
+
+    #[test]
     fn optionally_adds_damage_at_hold_end() {
         let (output, warnings) = convert_str_with_options(
             MAP,
             ConvertOptions {
                 damage_ln_end: true,
+                ..ConvertOptions::default()
             },
         )
         .unwrap();

@@ -2,8 +2,11 @@
 name = "osu2ugc"
 version = "0.1.0"
 edition = "2021"
-description = "Convert osu!mania 4K .osu beatmaps to UMIGURI .ugc charts"
+description = "Convert osu!mania 4K / 5K / 6K / 7K .osu beatmaps to UMIGURI .ugc charts"
 license = "MIT"
+
+[dependencies]
+sha2 = "0.10"
 
 [profile.release]
 strip = true
